@@ -2,10 +2,10 @@ const axios = require('axios');
 const readline = require('readline');
 
 // Shopify API 설정
-const SHOPIFY_API_KEY = "67711a5b6f337db6676fb45dc69bf5b0";
-const SHOPIFY_API_SECRET = "346f168440d662806ab7198f8e11d264";
-const SHOPIFY_SHOP_DOMAIN = "hallyusuperstore19.myshopify.com";
-const SHOPIFY_ADMIN_ACCESS_TOKEN = "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";
+const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
+const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = "2025-04";
 
 // 대상 컬렉션과 위치
