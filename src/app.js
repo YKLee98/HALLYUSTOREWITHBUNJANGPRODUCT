@@ -24,6 +24,12 @@ const orderSyncController = require('./controllers/orderSyncController');
 const apiRoutes = require('./api');
 const { getQueue } = require('./jobs/queues');
 
+// 주문 취소 작업 큐 초기화
+if (config.redis.enabled) {
+  const orderCancellationJob = require('./jobs/orderCancellationJob');
+  logger.info('[App] Order cancellation job queue initialized');
+}
+
 const app = express();
 
 // --- 기본 보안 및 유틸리티 미들웨어 ---
