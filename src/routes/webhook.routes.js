@@ -1,6 +1,6 @@
 // src/routes/webhook.routes.js
 // Shopify 웹훅을 처리하는 라우터
-// 수정사항: 판매 상태에 따른 상품 처리 로직 추가
+// 통합: 주문 취소 서비스 (orderCancellationService) 연동
 
 const express = require('express');
 const router = express.Router();
@@ -11,6 +11,7 @@ const orderService = require('../services/orderService');
 const inventoryService = require('../services/inventoryService');
 const shopifyService = require('../services/shopifyService');
 const SyncedProduct = require('../models/syncedProduct.model');
+const { handleOrderCreationResult, handleOrderUpdate } = require('../hooks/orderCancellationHooks');
 
 // Shopify 웹훅 검증 미들웨어
 const verifyWebhook = (req, res, next) => {
@@ -36,14 +37,30 @@ const verifyWebhook = (req, res, next) => {
   next();
 };
 
-// 주문 생성 웹훅
+// 주문 생성 웹훅 (주문 취소 서비스 통합)
 router.post('/orders/create', verifyWebhook, async (req, res) => {
   try {
     const order = req.body;
     logger.info(`[Webhook] Order created: #${order.order_number || order.name} (${order.id})`);
     
     // 번개장터 주문 처리를 위한 큐에 추가
-    await orderService.queueBunjangOrderCreation(order);
+    const bunjangResult = await orderService.queueBunjangOrderCreation(order);
+    
+    // 주문 취소 서비스: 번개장터 주문 생성 결과 확인
+    try {
+      const cancellationResult = await handleOrderCreationResult(order, bunjangResult);
+      
+      if (cancellationResult.scheduled) {
+        logger.warn(`[Webhook] Order cancellation scheduled for #${order.name}`, {
+          immediate: cancellationResult.immediate,
+          partial: cancellationResult.partial,
+          delay: cancellationResult.delay
+        });
+      }
+    } catch (cancellationError) {
+      // 취소 예약 실패해도 웹훅 응답은 성공으로 처리
+      logger.error('[Webhook] Failed to schedule order cancellation:', cancellationError);
+    }
     
     res.status(200).json({ status: 'success' });
   } catch (error) {
@@ -142,11 +159,29 @@ router.post('/orders/fulfilled', verifyWebhook, async (req, res) => {
   }
 });
 
-// 주문 업데이트 웹훅
+// 주문 업데이트 웹훅 (주문 취소 서비스 통합)
 router.post('/orders/updated', verifyWebhook, async (req, res) => {
   try {
     const order = req.body;
     logger.info(`[Webhook] Order updated: #${order.order_number || order.name} (${order.id})`);
+    
+    // 이전 태그 정보 저장 (가능한 경우)
+    const previousTags = res.locals.previousTags || [];
+    
+    // 주문 취소 서비스: 새로운 에러 태그 확인
+    try {
+      const updateResult = await handleOrderUpdate(order, previousTags);
+      
+      if (updateResult.scheduled) {
+        logger.warn(`[Webhook] Order cancellation scheduled due to error tags:`, {
+          orderName: order.name,
+          urgent: updateResult.urgent,
+          errors: updateResult.errors
+        });
+      }
+    } catch (updateError) {
+      logger.error('[Webhook] Failed to handle order update for cancellation:', updateError);
+    }
     
     // 주문 상태가 cancelled로 변경된 경우
     if (order.cancelled_at || order.cancel_reason) {
