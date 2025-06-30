@@ -360,4 +360,7 @@ router.post('/products/delete', verifyWebhook, async (req, res) => {
   }
 });
 
+router.get('/sync/status/:jobId', productSyncController.checkJobStatus);
+router.get('/orders/:orderId/status', orderSyncController.checkOrderProcessingStatus);
+
 module.exports = router;
