@@ -102,43 +102,42 @@ async function downloadAndUnzipCatalogContent(filename) {
     });
 
     logger.info(`[BunjangSvc] Catalog file "${filename}" downloaded. Unzipping...`);
-    return new Promise((resolve, reject) => {
-      zlib.unzip(response.data, (err, buffer) => {
+    const buffer = Buffer.from(response.data);
+    const unzippedContent = await new Promise((resolve, reject) => {
+      zlib.gunzip(buffer, (err, unzipped) => {
         if (err) {
-          logger.error(`[BunjangSvc] Failed to unzip catalog "${filename}":`, err);
-          return reject(new AppError(`카탈로그 파일 압축 해제 실패: ${filename}`, 500, 'CATALOG_UNZIP_ERROR', true, err));
+          logger.error(`[BunjangSvc] Failed to unzip catalog file "${filename}": ${err.message}`);
+          reject(new AppError(`카탈로그 파일 압축 해제 실패: ${err.message}`, 500, 'CATALOG_UNZIP_ERROR'));
+        } else {
+          resolve(unzipped.toString('utf8'));
         }
-        logger.info(`[BunjangSvc] Catalog file "${filename}" unzipped successfully.`);
-        resolve(buffer.toString('utf-8')); // CSV는 보통 UTF-8
       });
     });
+
+    logger.info(`[BunjangSvc] Catalog file "${filename}" unzipped successfully.`);
+    return unzippedContent;
   } catch (error) {
-    logger.error(`[BunjangSvc] Error in downloadAndUnzipCatalogContent for "${filename}": ${error.message}`);
+    // ExternalServiceError는 인터셉터에서 throw됨
+    logger.error(`[BunjangSvc] Failed to download/unzip Bunjang catalog "${filename}": ${error.message}`);
     if (error instanceof AppError || error instanceof ExternalServiceError) throw error;
-    throw new AppError(`카탈로그 콘텐츠 다운로드 및 압축 해제 중 오류 (${filename}): ${error.message}`, 500, 'CATALOG_DOWNLOAD_PROCESS_ERROR');
+    throw new AppError(`번개장터 카탈로그 다운로드 실패: ${error.message}`, 500, 'CATALOG_DOWNLOAD_ERROR');
   }
 }
 
 /**
- * 번개장터 상품 상세 정보를 조회합니다. (Product Lookup API: /api/v1/products/{pid})
- * @param {string} pid - 조회할 번개장터 상품 ID.
- * @returns {Promise<object|null>} 번개장터 상품 상세 정보 객체, 또는 찾을 수 없거나 에러 시 null.
+ * 번개장터 상품 상세 정보를 조회합니다.
+ * @param {string|number} pid - 번개장터 상품 ID
+ * @returns {Promise<object|null>} 상품 정보 또는 null
  */
 async function getBunjangProductDetails(pid) {
-  if (!pid) {
-    logger.warn('[BunjangSvc] PID is required to fetch product details.');
-    return null;
-  }
-  logger.debug(`[BunjangSvc] Fetching product details for Bunjang PID: ${pid}`);
+  logger.info(`[BunjangSvc] Fetching Bunjang product details for PID ${pid}`);
   try {
     const response = await bunjangApiClient.get(`/api/v1/products/${pid}`);
     if (response.data && response.data.data) {
       const product = response.data.data;
       
-      // 상태 필드 정규화 - saleStatus가 실제 사용되는 필드명
-      let normalizedStatus = 'SELLING'; // 기본값
-      
-      // saleStatus가 가장 확실한 필드이므로 우선 확인
+      // 상태 정규화 (다양한 필드명 대응)
+      let normalizedStatus = 'UNKNOWN';
       if (product.saleStatus !== undefined) {
         normalizedStatus = product.saleStatus;
       } else if (product.status !== undefined) {
@@ -147,12 +146,6 @@ async function getBunjangProductDetails(pid) {
         normalizedStatus = product.state;
       } else if (product.sellStatus !== undefined) {
         normalizedStatus = product.sellStatus;
-      } else if (product.sell_status !== undefined) {
-        normalizedStatus = product.sell_status;
-      } else if (product.sellingStatus !== undefined) {
-        normalizedStatus = product.sellingStatus;
-      } else if (product.selling_status !== undefined) {
-        normalizedStatus = product.selling_status;
       } else if (product.productStatus !== undefined) {
         normalizedStatus = product.productStatus;
       } else if (product.product_status !== undefined) {
@@ -276,47 +269,55 @@ async function confirmBunjangOrder(orderId) {
 }
 
 /**
- * 번개장터 주문 상세 정보를 조회합니다. (Order Lookup API: /api/v1/orders/{orderId})
+ * 번개장터 주문 상세 정보를 조회합니다.
  * @param {number|string} orderId - 번개장터 주문 ID
- * @returns {Promise<object|null>} 주문 상세 정보 또는 null
+ * @returns {Promise<object|null>} 주문 정보 또는 null
  */
 async function getBunjangOrderDetails(orderId) {
-  logger.info(`[BunjangSvc] Fetching order details for Bunjang order: ${orderId}`);
+  logger.info(`[BunjangSvc] Fetching Bunjang order details for order ID ${orderId}`);
   try {
     const response = await bunjangApiClient.get(`/api/v1/orders/${orderId}`);
     if (response.data && response.data.data) {
-      logger.info(`[BunjangSvc] Successfully fetched order details for order ${orderId}`);
+      logger.info(`[BunjangSvc] Successfully fetched order details for order ID ${orderId}`);
       return response.data.data;
     }
     return null;
   } catch (error) {
-    if (error.response?.status === 404) {
-      logger.info(`[BunjangSvc] Bunjang order ${orderId} not found (404)`);
+    if (error instanceof ExternalServiceError && error.originalError?.response?.status === 404) {
+      logger.info(`[BunjangSvc] Bunjang order with ID ${orderId} not found (404)`);
       return null;
     }
-    logger.error(`[BunjangSvc] Failed to fetch Bunjang order details for ${orderId}: ${error.message}`);
-    return null;
+    logger.error(`[BunjangSvc] Failed to fetch Bunjang order details for order ID ${orderId}: ${error.message}`);
+    throw error;
   }
 }
 
 /**
- * 번개장터 주문 목록을 조회합니다. (Orders Lookup API: /api/v1/orders)
+ * 번개장터 주문 목록을 조회합니다. (Orders Retrieval API: /api/v1/orders)
  * @param {object} params - 조회 파라미터
- * @param {string} params.statusUpdateStartDate - 조회 시작일 (UTC, 예: '2024-11-01T19:12:00Z')
- * @param {string} params.statusUpdateEndDate - 조회 종료일 (UTC, 예: '2024-11-15T19:12:00Z')
+ * @param {string} params.statusUpdateStartDate - 상태 업데이트 시작일 (ISO 형식)
+ * @param {string} params.statusUpdateEndDate - 상태 업데이트 종료일 (ISO 형식)
  * @param {number} [params.page=0] - 페이지 번호
  * @param {number} [params.size=100] - 페이지 크기 (최대 100)
  * @returns {Promise<object>} 주문 목록 응답
  */
 async function getBunjangOrders(params) {
-  logger.info('[BunjangSvc] Fetching Bunjang orders list', params);
+  logger.info('[BunjangSvc] Fetching Bunjang orders', params);
   try {
-    const response = await bunjangApiClient.get('/api/v1/orders', { params });
+    const response = await bunjangApiClient.get('/api/v1/orders', {
+      params: {
+        statusUpdateStartDate: params.statusUpdateStartDate,
+        statusUpdateEndDate: params.statusUpdateEndDate,
+        page: params.page || 0,
+        size: Math.min(params.size || 100, 100) // 최대 100
+      }
+    });
+    
     if (response.data) {
       logger.info(`[BunjangSvc] Successfully fetched ${response.data.data?.length || 0} orders`);
       return response.data;
     }
-    return { data: [], page: 0, size: 0, totalPages: 0, totalElements: 0 };
+    return { data: [], totalPages: 0 };
   } catch (error) {
     logger.error(`[BunjangSvc] Failed to fetch Bunjang orders: ${error.message}`);
     if (error instanceof AppError || error instanceof ExternalServiceError) throw error;
@@ -325,21 +326,16 @@ async function getBunjangOrders(params) {
 }
 
 /**
- * 번개장터 포인트 잔액을 조회합니다. (Point Balance Lookup API: /api/v1/points/balance)
- * @returns {Promise<object|null>} 포인트 잔액 정보 또는 null
- * 반환값: { balance: number (현재 잔액), pointExpiredIn30Days: number (30일 내 만료 예정 포인트) }
+ * 번개장터 포인트 잔액을 조회합니다. (Points Balance API: /api/v1/points/balance)
+ * @returns {Promise<{balance: number}|null>} 포인트 잔액 정보 또는 null
  */
 async function getBunjangPointBalance() {
   logger.info('[BunjangSvc] Fetching Bunjang point balance');
   try {
     const response = await bunjangApiClient.get('/api/v1/points/balance');
     if (response.data && response.data.data) {
-      const balanceData = response.data.data;
-      logger.info('[BunjangSvc] Successfully fetched point balance:', {
-        balance: balanceData.balance,
-        expiringIn30Days: balanceData.pointExpiredIn30Days
-      });
-      return balanceData;
+      logger.info(`[BunjangSvc] Current point balance: ${response.data.data.balance.toLocaleString()} KRW`);
+      return response.data.data;
     }
     return null;
   } catch (error) {
@@ -349,7 +345,7 @@ async function getBunjangPointBalance() {
 }
 
 /**
- * 번개장터 상품 목록을 검색합니다. (Products Retrieval API: /api/v1/products)
+ * 번개장터 상품을 검색합니다. (Products Retrieval API: /api/v1/products)
  * @param {object} params - 검색 파라미터
  * @param {string} [params.q] - 검색어
  * @param {string} [params.categoryId] - 카테고리 ID (쉼표로 구분하여 다중 검색 가능)
@@ -397,6 +393,32 @@ async function getBunjangBrands() {
   }
 }
 
+// BunjangOrderService에서 가져온 배송 회사 매핑
+function mapDeliveryCompany(companyCode) {
+  const companyMap = {
+    'cj': 'CJ Logistics',
+    'hanjin': 'Hanjin Express',
+    'lotte': 'Lotte Global Logistics',
+    'post': 'Korea Post',
+    'logen': 'Logen'
+  };
+  
+  return companyMap[companyCode] || companyCode;
+}
+
+// BunjangOrderService에서 가져온 배송 추적 URL 생성
+function getTrackingUrl(companyCode, trackingNumber) {
+  const urlMap = {
+    'cj': `https://www.cjlogistics.com/ko/tool/parcel/tracking?gnbInvcNo=${trackingNumber}`,
+    'hanjin': `https://www.hanjin.co.kr/kor/CMS/DeliveryMgr/WaybillResult.do?mCode=MN038&schLang=KR&wblnumText2=${trackingNumber}`,
+    'lotte': `https://www.lotteglogis.com/home/reservation/tracking/linkView?InvNo=${trackingNumber}`,
+    'post': `https://service.epost.go.kr/trace.RetrieveDomRigiTraceList.comm?sid1=${trackingNumber}`,
+    'logen': `https://www.ilogen.com/web/personal/trace/${trackingNumber}`
+  };
+  
+  return urlMap[companyCode] || '#';
+}
+
 module.exports = {
   downloadAndUnzipCatalogContent,
   getBunjangProductDetails,
@@ -407,4 +429,6 @@ module.exports = {
   getBunjangPointBalance,
   searchBunjangProducts,
   getBunjangBrands,
+  mapDeliveryCompany,
+  getTrackingUrl,
 };
