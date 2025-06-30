@@ -8,6 +8,8 @@ const shopifyService = require('./shopifyService');
 const inventoryService = require('./inventoryService');
 const SyncedProduct = require('../models/syncedProduct.model');
 const { AppError, ExternalServiceError, NotFoundError, ValidationError } = require('../utils/customErrors');
+const { getQueue } = require('../jobs/queues');
+const { mapShopifyItemToBunjangOrderPayload } = require('../mappers/orderMapper');
 
 // 환경 변수로 상태 체크 스킵 여부 제어
 const SKIP_STATUS_CHECK = process.env.SKIP_BUNJANG_STATUS_CHECK === 'true';
@@ -64,8 +66,6 @@ async function processShopifyOrderForBunjang(shopifyOrder, jobId = 'N/A') {
         query getProductTags($id: ID!) {
           product(id: $id) {
             id
-            title
-            handle
             tags
           }
         }
@@ -73,51 +73,43 @@ async function processShopifyOrderForBunjang(shopifyOrder, jobId = 'N/A') {
       
       try {
         const productGid = `gid://shopify/Product/${productId}`;
-        const productResponse = await shopifyService.shopifyGraphqlRequest(productQuery, { id: productGid });
-        const product = productResponse.data?.product;
+        const response = await shopifyService.shopifyGraphqlRequest(productQuery, { id: productGid });
         
-        if (product) {
-          const bunjangPidTag = product.tags.find(tag => tag.startsWith('bunjang_pid:'));
+        if (response.data?.product?.tags) {
+          const bunjangPidTag = response.data.product.tags.find(tag => tag.startsWith('bunjang_pid:'));
           
           if (bunjangPidTag) {
-            const bunjangPid = bunjangPidTag.split(':')[1].trim();
+            const bunjangPid = bunjangPidTag.split(':')[1];
+            logger.info(`[OrderSvc:Job-${jobId}] Found bunjang_pid tag: ${bunjangPid} for product ${productId}`);
             
-            // DB에 저장
-            syncedProduct = await SyncedProduct.create({
-              shopifyGid: product.id,
-              shopifyData: {
-                id: productId,
-                title: product.title,
-                handle: product.handle
-              },
-              bunjangPid: String(bunjangPid),
-              bunjangProductName: product.title,
-              syncStatus: 'SYNCED',
-              lastSyncedAt: new Date()
-            });
-            
-            logger.info(`[OrderSvc:Job-${jobId}] Auto-synced product from tags: ${product.title} (Bunjang PID: ${bunjangPid})`);
+            // 임시 syncedProduct 객체 생성
+            syncedProduct = {
+              bunjangPid: bunjangPid,
+              shopifyGid: productGid,
+              // 이 상품은 DB에 없으므로 나중에 동기화 필요
+              needsSync: true
+            };
           }
         }
       } catch (error) {
-        logger.error(`[OrderSvc:Job-${jobId}] Error fetching product tags: ${error.message}`);
+        logger.error(`[OrderSvc:Job-${jobId}] Failed to check Shopify tags for product ${productId}: ${error.message}`);
       }
     }
     
     if (!syncedProduct || !syncedProduct.bunjangPid) {
-      logger.debug(`[OrderSvc:Job-${jobId}] Shopify product ${productId} is not linked to Bunjang. Skipping.`);
+      logger.warn(`[OrderSvc:Job-${jobId}] No bunjang connection found for product ${productId}, skipping`);
       continue;
     }
-
+    
     const bunjangPid = syncedProduct.bunjangPid;
-    logger.info(`[OrderSvc:Job-${jobId}] Found Bunjang-linked item: Shopify Product ${productId} -> Bunjang PID ${bunjangPid}`);
-
+    logger.info(`[OrderSvc:Job-${jobId}] Processing order for Bunjang PID: ${bunjangPid}`);
+    
     try {
-      // 3. 주문 시점의 번개장터 상품 최신 정보 조회
+      // 3. 번개장터 상품 상세 정보 조회
       const bunjangProductDetails = await bunjangService.getBunjangProductDetails(bunjangPid);
       
       if (!bunjangProductDetails) {
-        logger.warn(`[OrderSvc:Job-${jobId}] Could not fetch details for Bunjang product PID ${bunjangPid}`);
+        logger.error(`[OrderSvc:Job-${jobId}] Bunjang product details not found for PID ${bunjangPid}`);
         await shopifyService.updateOrder({ 
           id: shopifyOrderGid, 
           tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-NotFound`] 
@@ -125,61 +117,33 @@ async function processShopifyOrderForBunjang(shopifyOrder, jobId = 'N/A') {
         continue;
       }
 
-      // 3-1. 상품 판매 상태 확인 - saleStatus와 status 모두 확인
-      const productStatus = bunjangProductDetails.status || bunjangProductDetails.saleStatus;
-      
-      logger.info(`[OrderSvc:Job-${jobId}] Product status check for PID ${bunjangPid}:`, {
-        normalizedStatus: bunjangProductDetails.status,
-        originalSaleStatus: bunjangProductDetails.saleStatus,
-        quantity: bunjangProductDetails.quantity,
-        skipStatusCheck: SKIP_STATUS_CHECK
-      });
-      
-      if (!SKIP_STATUS_CHECK && productStatus !== 'SELLING') {
-        logger.warn(`[OrderSvc:Job-${jobId}] Product PID ${bunjangPid} is not available for sale. Status: ${productStatus}`, {
-          allStatusFields: {
-            status: bunjangProductDetails.status,
-            saleStatus: bunjangProductDetails.saleStatus,
-            quantity: bunjangProductDetails.quantity
-          }
-        });
+      // 4. 상태 체크 (환경 변수로 스킵 가능)
+      if (!SKIP_STATUS_CHECK) {
+        const productStatus = bunjangProductDetails.status || bunjangProductDetails.saleStatus;
+        const productQuantity = bunjangProductDetails.quantity || 0;
         
-        await shopifyService.updateOrder({ 
-          id: shopifyOrderGid, 
-          tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-NotAvailable`, `Status-${productStatus}`] 
-        });
+        if (productStatus !== 'SELLING') {
+          logger.warn(`[OrderSvc:Job-${jobId}] Bunjang product ${bunjangPid} is not in SELLING status. Current status: ${productStatus}`);
+          await shopifyService.updateOrder({ 
+            id: shopifyOrderGid, 
+            tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-NotSelling-${productStatus}`] 
+          });
+          continue;
+        }
         
-        continue;
+        if (productQuantity === 0) {
+          logger.warn(`[OrderSvc:Job-${jobId}] Bunjang product ${bunjangPid} has no stock. Quantity: ${productQuantity}`);
+          await shopifyService.updateOrder({ 
+            id: shopifyOrderGid, 
+            tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-NoStock`] 
+          });
+          continue;
+        }
       }
 
-      // 4. 재고 확인
-      const availableQuantity = bunjangProductDetails.quantity || 0;
-      if (availableQuantity < item.quantity) {
-        logger.warn(`[OrderSvc:Job-${jobId}] Insufficient stock for PID ${bunjangPid}. Available: ${availableQuantity}, Requested: ${item.quantity}`);
-        await shopifyService.updateOrder({ 
-          id: shopifyOrderGid, 
-          tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-InsufficientStock`] 
-        });
-        continue;
-      }
-
-      // 5. 번개장터 주문 페이로드 생성
-      const bunjangOrderPayload = {
-        product: {
-          id: parseInt(bunjangPid),
-          price: bunjangProductDetails.price || 0
-        },
-        deliveryPrice: bunjangProductDetails.shippingFee || 0 // 배송비 0원 정책 적용
-      };
+      // 5. 주문 페이로드 생성
+      const bunjangOrderPayload = mapShopifyItemToBunjangOrderPayload(item, bunjangPid, bunjangProductDetails);
       
-      const actualBunjangShippingFeeKrw = bunjangProductDetails.shippingFee || 0;
-      logger.info(`[OrderSvc:Job-${jobId}] Creating Bunjang order for PID ${bunjangPid}:`, {
-        price: bunjangOrderPayload.product.price,
-        actualShipping: actualBunjangShippingFeeKrw,
-        appliedShipping: 0,
-        totalAmount: bunjangOrderPayload.product.price
-      });
-
       // 6. 번개장터 주문 생성 API 호출
       try {
         const bunjangApiResponse = await bunjangService.createBunjangOrderV2(bunjangOrderPayload);
@@ -213,125 +177,25 @@ async function processShopifyOrderForBunjang(shopifyOrder, jobId = 'N/A') {
             logger.warn(`[OrderSvc:Job-${jobId}] Failed to check point balance: ${balanceError.message}`);
           }
           
-          // 9. 상품 판매 상태 업데이트
-          try {
-            // DB에서 상품 정보 업데이트
-            const productToUpdate = await SyncedProduct.findOne({ bunjangPid });
-            if (productToUpdate) {
-              // 번개장터 주문 정보 추가
-              if (!productToUpdate.bunjangOrderIds) {
-                productToUpdate.bunjangOrderIds = [];
-              }
-              productToUpdate.bunjangOrderIds.push(String(bunjangOrderId));
-              productToUpdate.lastBunjangOrderId = String(bunjangOrderId);
-              productToUpdate.bunjangSoldAt = new Date();
-              
-              // 판매 상태 결정
-              if (productToUpdate.shopifySoldAt || productToUpdate.pendingBunjangOrder) {
-                // Shopify에서도 팔린 경우 - SOLD OUT으로 표기
-                productToUpdate.soldFrom = 'both';
-                await productToUpdate.save();
-                
-                // inventoryService를 사용하여 SOLD OUT 처리
-                await inventoryService.handleProductSoldStatus(
-                  bunjangPid,
-                  productToUpdate.shopifyGid,
-                  'both'
-                );
-                
-                logger.info(`[OrderSvc:Job-${jobId}] Product marked as SOLD OUT (sold on both platforms): PID ${bunjangPid}`);
-              } else {
-                // 번개장터에서만 팔린 경우 - DRAFT 상태로 변경
-                productToUpdate.soldFrom = 'bunjang';
-                productToUpdate.bunjangSoldAt = new Date();
-                await productToUpdate.save();
-                
-                // inventoryService를 사용하여 DRAFT 처리
-                await inventoryService.handleProductSoldStatus(
-                  bunjangPid,
-                  productToUpdate.shopifyGid,
-                  'bunjang'
-                );
-                
-                logger.info(`[OrderSvc:Job-${jobId}] Product marked as DRAFT (sold only on Bunjang): PID ${bunjangPid}`);
-              }
-              
-              // pendingBunjangOrder 플래그 해제
-              productToUpdate.pendingBunjangOrder = false;
-              await productToUpdate.save();
-            }
-          } catch (statusError) {
-            logger.error(`[OrderSvc:Job-${jobId}] Failed to update product status after Bunjang order:`, statusError);
-          }
+          // 9. 재고 상태 업데이트
+          await inventoryService.handleProductSoldStatus(
+            bunjangPid,
+            syncedProduct.shopifyGid,
+            'shopify'
+          );
+          
         } else {
-          logger.error(`[OrderSvc:Job-${jobId}] Bunjang order creation response missing order ID for PID ${bunjangPid}`);
-          await shopifyService.updateOrder({ id: shopifyOrderGid, tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-NoOrderId`] });
-        }
-      } catch (apiError) {
-        // 번개장터 API 에러 처리
-        let errorTag = `PID-${bunjangPid}-CreateFail`;
-        let errorMessage = apiError.message;
-        
-        if (apiError.originalError?.response?.data?.errorCode) {
-          const errorCode = apiError.originalError.response.data.errorCode;
-          const errorReason = apiError.originalError.response.data.reason || apiError.originalError.response.data.message;
-          errorMessage = `${errorCode}: ${errorReason || apiError.message}`;
-          
-          logger.error(`[OrderSvc:Job-${jobId}] Bunjang API error details:`, {
-            errorCode: errorCode,
-            reason: errorReason,
-            fullResponse: apiError.originalError.response.data
+          logger.error(`[OrderSvc:Job-${jobId}] Bunjang API response missing order ID for PID ${bunjangPid}`);
+          await shopifyService.updateOrder({ 
+            id: shopifyOrderGid, 
+            tags: [`${bunjangOrderIdentifier}_Error`, `PID-${bunjangPid}-InvalidResponse`] 
           });
-          
-          switch(errorCode) {
-            case 'PRODUCT_NOT_FOUND':
-            case 'PRODUCT_SOLD_OUT':
-            case 'PRODUCT_ON_HOLD':
-              errorTag = `PID-${bunjangPid}-NotAvailable-${errorCode}`;
-              
-              // 이미 판매된 상품인 경우 DB 업데이트
-              try {
-                const soldProduct = await SyncedProduct.findOne({ bunjangPid });
-                if (soldProduct && !soldProduct.bunjangSoldAt) {
-                  soldProduct.bunjangSoldAt = new Date();
-                  soldProduct.soldFrom = 'unknown';
-                  soldProduct.notes = `${soldProduct.notes || ''}\n[${new Date().toISOString()}] Order failed: ${errorCode}`;
-                  await soldProduct.save();
-                }
-              } catch (updateError) {
-                logger.error(`[OrderSvc:Job-${jobId}] Failed to update sold product status:`, updateError);
-              }
-              break;
-              
-            case 'INVALID_PRODUCT_PRICE':
-              errorTag = `PID-${bunjangPid}-PriceChanged`;
-              logger.error(`[OrderSvc:Job-${jobId}] Product price mismatch for PID ${bunjangPid}. Expected: ${bunjangOrderPayload.product.price}`);
-              break;
-              
-            case 'POINT_SHORTAGE':
-              errorTag = `PID-${bunjangPid}-InsufficientPoints`;
-              logger.error(`[OrderSvc:Job-${jobId}] ❌ CRITICAL: Insufficient Bunjang points for order`);
-              // 긴급 알림 필요
-              await shopifyService.updateOrder({ 
-                id: shopifyOrderGid, 
-                tags: [`URGENT-InsufficientPoints`] 
-              });
-              break;
-              
-            case 'INVALID_AUTH_TOKEN':
-            case 'UNAUTHORIZED':
-              errorTag = `AuthenticationError`;
-              logger.error(`[OrderSvc:Job-${jobId}] ❌ CRITICAL: Bunjang authentication failed`);
-              await shopifyService.updateOrder({ 
-                id: shopifyOrderGid, 
-                tags: [`URGENT-AuthenticationError`] 
-              });
-              break;
-              
-            default:
-              errorTag = `PID-${bunjangPid}-${errorCode || 'UnknownError'}`;
-          }
         }
+        
+      } catch (apiError) {
+        const errorMessage = apiError.message || 'Unknown API error';
+        const errorCode = apiError.errorCode || 'UNKNOWN_ERROR';
+        const errorTag = `PID-${bunjangPid}-${errorCode}`;
         
         logger.error(`[OrderSvc:Job-${jobId}] Failed to create Bunjang order for PID ${bunjangPid}: ${errorMessage}`, {
           errorStack: apiError.stack,
@@ -397,14 +261,50 @@ async function processShopifyOrderForBunjang(shopifyOrder, jobId = 'N/A') {
  */
 async function queueBunjangOrderCreation(shopifyOrder) {
   try {
-    // TODO: BullMQ 등을 사용하여 큐에 추가하는 로직 구현
     logger.info(`[OrderSvc] Queuing Bunjang order creation for Shopify order ${shopifyOrder.id}`);
     
-    // 임시로 직접 처리
-    await processShopifyOrderForBunjang(shopifyOrder, `QUEUE-${shopifyOrder.id}`);
+    // Redis와 BullMQ가 활성화되어 있는지 확인
+    if (!config.redis.enabled) {
+      logger.warn(`[OrderSvc] Redis is disabled. Processing order ${shopifyOrder.id} directly without queue.`);
+      // Redis가 비활성화된 경우 직접 처리 (개발/테스트 환경용)
+      return await processShopifyOrderForBunjang(shopifyOrder, `DIRECT-${shopifyOrder.id}`);
+    }
+    
+    // BullMQ 큐에 추가
+    const orderQueueName = config.bullmq.queues.order;
+    const orderQueue = getQueue(orderQueueName);
+    
+    if (!orderQueue) {
+      logger.error(`[OrderSvc] Order queue "${orderQueueName}" not available. Processing order ${shopifyOrder.id} directly.`);
+      // 큐가 없는 경우 직접 처리
+      return await processShopifyOrderForBunjang(shopifyOrder, `DIRECT-${shopifyOrder.id}`);
+    }
+    
+    const jobData = { 
+      shopifyOrder, 
+      receivedAt: new Date().toISOString() 
+    };
+    
+    // 중복 방지를 위한 고유 작업 ID
+    const jobId = `shopify-order-${shopifyOrder.id}`;
+    
+    const job = await orderQueue.add('ProcessShopifyOrder', jobData, { 
+      jobId,
+      removeOnComplete: true,
+      removeOnFail: false,
+      attempts: 3,
+      backoff: {
+        type: 'exponential',
+        delay: 2000,
+      }
+    });
+    
+    logger.info(`[OrderSvc] Order ${shopifyOrder.id} successfully added to queue with job ID: ${job.id}`);
+    
+    return { queued: true, jobId: job.id };
     
   } catch (error) {
-    logger.error(`[OrderSvc] Failed to queue order ${shopifyOrder.id}:`, error);
+    logger.error(`[OrderSvc] Failed to queue order ${shopifyOrder.id}: ${error.message}`, { stack: error.stack });
     throw error;
   }
 }
@@ -561,44 +461,31 @@ async function updateShopifyOrderFromBunjangStatus(bunjangOrder, jobId = 'N/A') 
         try {
           const syncedProduct = await SyncedProduct.findOne({ bunjangPid: String(productId) });
           if (syncedProduct) {
-            syncedProduct.notes = `${syncedProduct.notes || ''}\n[${new Date().toISOString()}] Order ${status}`;
-            if (status === 'REFUNDED' || status === 'RETURNED') {
-              // 판매 상태 복원
-              syncedProduct.soldFrom = null;
-              syncedProduct.bunjangSoldAt = null;
-              await syncedProduct.save();
-              
-              // Shopify 상품 상태도 복원
-              if (syncedProduct.shopifyGid) {
-                await shopifyService.updateProduct({
-                  id: syncedProduct.shopifyGid,
-                  status: 'ACTIVE'
-                });
-              }
-            }
+            await inventoryService.restoreProductStatus(
+              syncedProduct.bunjangPid,
+              syncedProduct.shopifyGid
+            );
           }
-        } catch (restoreError) {
-          logger.error(`[OrderSvc:Job-${jobId}] Failed to restore product status:`, restoreError);
+        } catch (error) {
+          logger.error(`[OrderSvc:Job-${jobId}] Failed to restore product status for PID ${productId}: ${error.message}`);
         }
         break;
+        
+      default:
+        logger.warn(`[OrderSvc:Job-${jobId}] Unknown Bunjang order status: ${status}`);
     }
-    
-    // 상태 업데이트 시간 기록
-    await shopifyService.updateOrder({
-      id: shopifyOrderGid,
-      metafields: [{
-        namespace: 'bunjang',
-        key: 'last_status_sync',
-        value: new Date().toISOString(),
-        type: 'date_time'
-      }, {
-        namespace: 'bunjang',
-        key: 'last_bunjang_status',
-        value: status,
-        type: 'single_line_text_field'
-      }]
-    });
   }
+  
+  // 주문 상태 메타필드 업데이트
+  await shopifyService.updateOrder({
+    id: shopifyOrderGid,
+    metafields: [{
+      namespace: 'bunjang',
+      key: 'last_status_sync',
+      value: new Date().toISOString(),
+      type: 'date_time'
+    }]
+  });
 }
 
 /**
@@ -606,137 +493,114 @@ async function updateShopifyOrderFromBunjangStatus(bunjangOrder, jobId = 'N/A') 
  * @param {string} shopifyOrderGid - Shopify 주문 GID
  * @param {string} bunjangStatus - 번개장터 주문 상태
  * @param {object} orderItem - 번개장터 주문 아이템
- * @param {string} jobId - 작업 ID
+ * @param {string} [jobId='N/A'] - 작업 ID
  */
-async function updateShopifyFulfillmentStatus(shopifyOrderGid, bunjangStatus, orderItem, jobId) {
-  logger.info(`[OrderSvc:Job-${jobId}] Updating fulfillment status for order ${shopifyOrderGid} to ${bunjangStatus}`);
+async function updateShopifyFulfillmentStatus(shopifyOrderGid, bunjangStatus, orderItem, jobId = 'N/A') {
+  logger.info(`[OrderSvc:Job-${jobId}] Updating Shopify fulfillment for order ${shopifyOrderGid} with Bunjang status: ${bunjangStatus}`);
   
   // 배송 정보가 있는 경우
   if (orderItem.delivery && orderItem.delivery.invoice) {
-    const trackingInfo = {
-      company: orderItem.delivery.invoice.companyName,
-      number: orderItem.delivery.invoice.no,
-      url: orderItem.delivery.invoice.url
-    };
+    const trackingCompany = bunjangService.mapDeliveryCompany(orderItem.delivery.invoice.companyCode);
+    const trackingNumber = orderItem.delivery.invoice.no;
+    const trackingUrl = bunjangService.getTrackingUrl(orderItem.delivery.invoice.companyCode, trackingNumber);
     
-    logger.info(`[OrderSvc:Job-${jobId}] Tracking info:`, trackingInfo);
+    logger.info(`[OrderSvc:Job-${jobId}] Delivery info - Company: ${trackingCompany}, Tracking: ${trackingNumber}`);
     
-    // Shopify 태그 업데이트
-    const statusTag = `Shipping-${bunjangStatus}`;
-    const trackingTag = `Tracking-${trackingInfo.company}-${trackingInfo.number}`;
-    
-    await shopifyService.updateOrder({
-      id: shopifyOrderGid,
-      tags: [statusTag, trackingTag]
-    });
-    
-    // TODO: Shopify fulfillment API 호출 구현
+    // Shopify fulfillment 업데이트 로직
+    // 실제 구현은 shopifyService의 fulfillment 관련 메서드 호출
   }
 }
 
 /**
- * DRAFT 상태의 판매 완료 상품들을 주기적으로 확인하는 함수
- * 필요시 상품 정보를 업데이트하거나 리포트를 생성할 수 있음
+ * 판매 완료된 상품들의 상태를 확인합니다.
+ * @param {string} [jobId='N/A'] - 작업 ID
+ * @returns {Promise<{checked: number, needsUpdate: number}>}
  */
-async function checkSoldProductsStatus() {
+async function checkSoldProductsStatus(jobId = 'N/A') {
+  logger.info(`[OrderSvc:Job-${jobId}] Starting sold products status check`);
+  
   try {
-    logger.info('[OrderSvc] Checking sold products status...');
-    
-    // DRAFT 상태의 판매 완료 상품 찾기
+    // 번개장터에서 판매되어 DRAFT 상태인 상품들 찾기
     const soldProducts = await SyncedProduct.find({
-      $or: [
-        { soldFrom: 'bunjang' },
-        { soldFrom: 'both' }
-      ],
-      shopifyStatus: { $in: ['DRAFT', 'SOLD_OUT'] }
-    });
+      soldFrom: 'bunjang',
+      shopifyStatus: 'DRAFT'
+    }).limit(100);
     
-    logger.info(`[OrderSvc] Found ${soldProducts.length} sold products in DRAFT/SOLD_OUT status`);
-    
-    const stats = {
-      bunjangOnly: 0,
-      bothPlatforms: 0,
-      total: soldProducts.length,
-      oldProducts: []
-    };
+    let checkedCount = 0;
+    let needsUpdateCount = 0;
     
     for (const product of soldProducts) {
-      if (product.soldFrom === 'bunjang') {
-        stats.bunjangOnly++;
-      } else if (product.soldFrom === 'both') {
-        stats.bothPlatforms++;
-      }
-      
-      // 필요시 추가 처리 (예: 오래된 DRAFT 상품 확인)
-      const soldDate = product.bunjangSoldAt || product.shopifySoldAt;
-      if (soldDate) {
-        const daysSinceSold = (Date.now() - soldDate) / (1000 * 60 * 60 * 24);
-        if (daysSinceSold > 30) {
-          stats.oldProducts.push({
-            pid: product.bunjangPid,
-            days: Math.floor(daysSinceSold),
-            title: product.bunjangProductName
-          });
-          logger.info(`[OrderSvc] Product PID ${product.bunjangPid} has been in DRAFT status for ${Math.floor(daysSinceSold)} days`);
+      try {
+        // 번개장터 상품 상태 확인
+        const bunjangDetails = await bunjangService.getBunjangProductDetails(product.bunjangPid);
+        
+        if (bunjangDetails && bunjangDetails.status === 'SELLING') {
+          // 다시 판매 중인 경우
+          logger.warn(`[OrderSvc:Job-${jobId}] Product ${product.bunjangPid} is back to SELLING status`);
+          needsUpdateCount++;
+          
+          // 상품 상태 복원
+          await inventoryService.restoreProductStatus(
+            product.bunjangPid,
+            product.shopifyGid
+          );
         }
+        
+        checkedCount++;
+      } catch (error) {
+        logger.error(`[OrderSvc:Job-${jobId}] Failed to check product ${product.bunjangPid}: ${error.message}`);
       }
     }
     
-    logger.info('[OrderSvc] Sold products statistics:', stats);
+    logger.info(`[OrderSvc:Job-${jobId}] Sold products check completed. Checked: ${checkedCount}, Needs update: ${needsUpdateCount}`);
     
-    return stats;
+    return {
+      checked: checkedCount,
+      needsUpdate: needsUpdateCount
+    };
     
   } catch (error) {
-    logger.error('[OrderSvc] Failed to check sold products status:', error);
+    logger.error(`[OrderSvc:Job-${jobId}] Failed to check sold products: ${error.message}`);
     throw error;
   }
 }
 
 /**
- * 특정 기간 이상된 DRAFT 상품들을 ARCHIVED로 변경하는 함수 (선택적)
- * @param {number} daysThreshold - 일수 임계값 (기본 90일)
+ * 오래된 판매 완료 상품들을 아카이브합니다.
+ * @param {number} [daysOld=30] - 며칠 이상 된 상품을 아카이브할지
+ * @returns {Promise<{found: number, archived: number}>}
  */
-async function archiveOldSoldProducts(daysThreshold = 90) {
+async function archiveOldSoldProducts(daysOld = 30) {
   try {
-    logger.info(`[OrderSvc] Archiving products sold more than ${daysThreshold} days ago...`);
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysOld);
     
-    const thresholdDate = new Date(Date.now() - daysThreshold * 24 * 60 * 60 * 1000);
+    logger.info(`[OrderSvc] Archiving sold products older than ${daysOld} days (before ${cutoffDate.toISOString()})`);
     
     const oldProducts = await SyncedProduct.find({
-      $or: [
-        { bunjangSoldAt: { $lt: thresholdDate } },
-        { shopifySoldAt: { $lt: thresholdDate } }
-      ],
+      soldFrom: { $exists: true },
+      soldAt: { $lt: cutoffDate },
       shopifyStatus: 'DRAFT'
-    });
-    
-    logger.info(`[OrderSvc] Found ${oldProducts.length} old products to archive`);
+    }).limit(100);
     
     let archivedCount = 0;
     
     for (const product of oldProducts) {
       try {
-        // Shopify에서 ARCHIVED 상태로 변경
-        if (product.shopifyGid) {
-          await shopifyService.updateProduct({
-            id: product.shopifyGid,
-            status: 'ARCHIVED'
-          });
-          
-          // DB 업데이트
-          product.shopifyStatus = 'ARCHIVED';
-          product.notes = `${product.notes || ''}\n[${new Date().toISOString()}] Auto-archived after ${daysThreshold} days`;
-          await product.save();
-          
-          archivedCount++;
-          logger.info(`[OrderSvc] Archived product PID ${product.bunjangPid}: ${product.bunjangProductName}`);
-        }
-      } catch (archiveError) {
-        logger.error(`[OrderSvc] Failed to archive product PID ${product.bunjangPid}:`, archiveError);
+        await shopifyService.updateProductStatus(product.shopifyGid, 'ARCHIVED');
+        
+        product.shopifyStatus = 'ARCHIVED';
+        product.archivedAt = new Date();
+        await product.save();
+        
+        archivedCount++;
+        logger.info(`[OrderSvc] Archived product ${product.shopifyGid} (PID: ${product.bunjangPid})`);
+      } catch (error) {
+        logger.error(`[OrderSvc] Failed to archive product ${product.shopifyGid}: ${error.message}`);
       }
     }
     
-    logger.info(`[OrderSvc] Archive process completed. Archived ${archivedCount} products`);
+    logger.info(`[OrderSvc] Archive completed. Found: ${oldProducts.length}, Archived: ${archivedCount}`);
     
     return {
       found: oldProducts.length,
@@ -927,5 +791,5 @@ module.exports = {
   checkSoldProductsStatus,
   archiveOldSoldProducts,
   reprocessShopifyOrder,
-  testBunjangProductOrder // 새로 추가
+  testBunjangProductOrder
 };
