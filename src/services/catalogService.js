@@ -326,12 +326,50 @@ async function verifyVariantPrice(variantId, expectedPrice) {
   }
 }
 
+// 기존 상품의 재고를 1로 확인하는 헬퍼 함수
+async function ensureInventoryIsOne(shopifyProductGid, bunjangPid, jobId) {
+  try {
+    const query = `
+      query getProductVariants($id: ID!) {
+        product(id: $id) {
+          id
+          variants(first: 1) {
+            edges {
+              node {
+                id
+                inventoryItem {
+                  id
+                  tracked
+                }
+              }
+            }
+          }
+        }
+      }`;
+    
+    const response = await shopifyService.shopifyGraphqlRequest(query, { id: shopifyProductGid });
+    const variant = response.data?.product?.variants?.edges?.[0]?.node;
+    
+    if (variant?.inventoryItem?.id) {
+      const locationId = process.env.SHOPIFY_DEFAULT_LOCATION_ID;
+      await shopifyService.updateInventoryLevel(variant.inventoryItem.id, locationId, 1);
+      logger.info(`[CatalogSvc:Job-${jobId}] Ensured inventory is 1 for existing product ${bunjangPid}`);
+      return { success: true };
+    } else {
+      return { success: false, message: 'No variant found' };
+    }
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+}
+
 async function syncBunjangProductToShopify(bunjangProduct, jobId = 'N/A') {
   const bunjangPid = bunjangProduct.pid;
   const bunjangName = bunjangProduct.name;
   const bunjangCatalogUpdatedAt = bunjangProduct.updatedAt;
+  const sku = `BJ-${bunjangPid}`; // SKU 미리 생성
 
-  logger.info(`[CatalogSvc:Job-${jobId}] Syncing Bunjang PID: ${bunjangPid}, Name: ${bunjangName}, Price: ${bunjangProduct.price} KRW, Quantity: 1 (always)`);
+  logger.info(`[CatalogSvc:Job-${jobId}] Syncing Bunjang PID: ${bunjangPid}, SKU: ${sku}, Name: ${bunjangName}, Price: ${bunjangProduct.price} KRW, Quantity: 1 (always)`);
   
   // 가격이 유효한지 먼저 체크
   if (!bunjangProduct.price || bunjangProduct.price <= 0) {
@@ -385,16 +423,101 @@ async function syncBunjangProductToShopify(bunjangProduct, jobId = 'N/A') {
   let shopifyProductGid = syncedDoc.shopifyGid;
   let existingVariant = null;
   
+  // ===== SKU 중복 체크 =====
+  // 1. DB에서 shopifyGid가 없으면 태그로 검색
   if (!shopifyProductGid && bunjangPid) {
     try {
       const existingShopifyProduct = await shopifyService.findProductByBunjangPidTag(bunjangPid);
       if (existingShopifyProduct?.id) {
         shopifyProductGid = existingShopifyProduct.id;
         logger.info(`[CatalogSvc:Job-${jobId}] Found existing Shopify product ${shopifyProductGid} for Bunjang PID ${bunjangPid} via tag search.`);
+        
+        // DB 업데이트
+        await SyncedProduct.updateOne(
+          { bunjangPid },
+          { 
+            $set: { 
+              shopifyGid: shopifyProductGid,
+              syncStatus: 'SYNCED',
+              lastSyncedAt: now,
+              syncErrorMessage: null
+            } 
+          }
+        );
       }
     } catch (tagSearchError) {
       logger.warn(`[CatalogSvc:Job-${jobId}] Error searching for existing product by tag for Bunjang PID ${bunjangPid}: ${tagSearchError.message}`);
       // Continue without existing product
+    }
+  }
+
+  // 2. SKU로 직접 검색 (추가된 로직) - 단, shopifyGid가 없을 때만
+  if (!shopifyProductGid) {
+    try {
+      logger.info(`[CatalogSvc:Job-${jobId}] Searching for existing product by SKU: ${sku}`);
+      
+      const skuSearchQuery = `
+        query searchProductBySku($query: String!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                id
+                title
+                status
+                variants(first: 5) {
+                  edges {
+                    node {
+                      id
+                      sku
+                      price
+                      inventoryItem {
+                        id
+                        tracked
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      
+      const skuSearchResponse = await shopifyService.shopifyGraphqlRequest(skuSearchQuery, { 
+        query: `sku:${sku}` 
+      });
+      
+      if (skuSearchResponse.data?.products?.edges?.length > 0) {
+        // SKU가 일치하는 상품 찾기
+        for (const edge of skuSearchResponse.data.products.edges) {
+          const product = edge.node;
+          const matchingVariant = product.variants.edges.find(v => v.node.sku === sku);
+          
+          if (matchingVariant) {
+            shopifyProductGid = product.id;
+            existingVariant = matchingVariant.node;
+            logger.warn(`[CatalogSvc:Job-${jobId}] ⚠️ Found existing product with same SKU ${sku}! Product GID: ${shopifyProductGid}`);
+            
+            // DB 업데이트
+            await SyncedProduct.updateOne(
+              { bunjangPid },
+              { 
+                $set: { 
+                  shopifyGid: shopifyProductGid,
+                  syncStatus: 'SYNCED',
+                  lastSyncedAt: now,
+                  syncErrorMessage: null
+                } 
+              }
+            );
+            
+            // 이미 존재하는 상품이므로 업데이트 모드로 전환
+            logger.info(`[CatalogSvc:Job-${jobId}] Found duplicate SKU ${sku}. Switching to update mode.`);
+          }
+        }
+      }
+    } catch (skuSearchError) {
+      logger.error(`[CatalogSvc:Job-${jobId}] Error searching for product by SKU: ${skuSearchError.message}`);
     }
   }
 
@@ -926,43 +1049,6 @@ async function syncBunjangProductToShopify(bunjangProduct, jobId = 'N/A') {
   }
 }
 
-// 기존 상품의 재고를 1로 확인하는 헬퍼 함수
-async function ensureInventoryIsOne(shopifyProductGid, bunjangPid, jobId) {
-  try {
-    const query = `
-      query getProductVariants($id: ID!) {
-        product(id: $id) {
-          id
-          variants(first: 1) {
-            edges {
-              node {
-                id
-                inventoryItem {
-                  id
-                  tracked
-                }
-              }
-            }
-          }
-        }
-      }`;
-    
-    const response = await shopifyService.shopifyGraphqlRequest(query, { id: shopifyProductGid });
-    const variant = response.data?.product?.variants?.edges?.[0]?.node;
-    
-    if (variant?.inventoryItem?.id) {
-      const locationId = process.env.SHOPIFY_DEFAULT_LOCATION_ID;
-      await shopifyService.updateInventoryLevel(variant.inventoryItem.id, locationId, 1);
-      logger.info(`[CatalogSvc:Job-${jobId}] Ensured inventory is 1 for existing product ${bunjangPid}`);
-      return { success: true };
-    } else {
-      return { success: false, message: 'No variant found' };
-    }
-  } catch (error) {
-    return { success: false, message: error.message };
-  }
-}
-
 async function fetchAndProcessBunjangCatalog(catalogType, jobIdForLog = 'N/A') {
   logger.info(`[CatalogSvc:Job-${jobIdForLog}] Starting Bunjang catalog processing. Type: ${catalogType}`);
   let catalogFileUrl;
@@ -1015,6 +1101,7 @@ async function fetchAndProcessBunjangCatalog(catalogType, jobIdForLog = 'N/A') {
         if (result.value.status === 'success') successfullyProcessed++;
         else if (result.value.status === 'skipped_filter') skippedByFilterCount++;
         else if (result.value.status === 'skipped_no_change') skippedNoChangeCount++;
+        else if (result.value.status === 'skipped_duplicate') skippedNoChangeCount++; // 중복도 스킵으로 카운트
         else if (result.value.status === 'error') errorCount++;
       } else if (result.status === 'rejected') {
         errorCount++;
@@ -1052,4 +1139,5 @@ module.exports = {
   parseCsvFileWithRowProcessor,
   downloadAndProcessFile,
   generateBunjangAuthHeader,
+  ensureInventoryIsOne
 };
