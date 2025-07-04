@@ -55,10 +55,8 @@ function mapShopifyItemToBunjangOrderPayload(shopifyLineItem, bunjangPid, bunjan
       id: parseInt(bunjangPid, 10),   // 번개장터 상품 ID (숫자)
       price: currentBunjangPriceKrw,   // 주문 시점의 실제 번개장터 상품 가격 (KRW, 정수)
     },
-    // 요구사항: "주문 시 배송비는 자동으로 0원으로 설정되며, 배송비는 별도로 이메일을 통해 고객에게 청구됨"
-    // 위 정책에 따라 deliveryPrice를 0으로 설정.
-    // 실제 배송비(currentBunjangShippingFeeKrw)는 orderService에서 별도로 메타필드에 기록.
-    deliveryPrice: 0,
+    // 실제 상품 상세 API에서 조회한 배송비를 그대로 사용
+    deliveryPrice: currentBunjangShippingFeeKrw,
   };
 
   // TODO: 번개장터 API v2에서는 배송지 정보를 받지 않는 것으로 보임.
