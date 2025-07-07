@@ -41,6 +41,7 @@ const syncedProductSchema = new mongoose.Schema({
   
   // 번개장터 원본 정보
   bunjangProductName: { type: String, trim: true },
+  englishTitle: { type: String, trim: true, index: true },
   bunjangCategoryId: { type: String, index: true, trim: true },
   bunjangBrandId: { type: String, index: true, trim: true },
   bunjangSellerUid: { type: String, index: true, trim: true },
